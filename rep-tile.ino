@@ -16,8 +16,8 @@ const char* ap_password = "password123";
 #define PN532_MISO 14
 #define PN532_MOSI 32
 #define BUTTON_PIN 4        
-#define BUZZER_PIN 5        
-#define RESET_MOTOR_PIN 15  
+#define BUZZER_PIN 19       
+#define RESET_MOTOR_PIN 23  
 
 // --- OLED Configuration ---
 // Both OLEDs share the same I2C bus (SDA/SCL) and address (0x3C).
@@ -30,12 +30,12 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 // --- SS (Chip Select) Pins Array ---
 // Currently 3 readers for testing. To expand to 9, add SS pin numbers here.
 // Example: const uint8_t SS_PINS[] = {26, 25, 13, XX, XX, XX, XX, XX, XX};
-const uint8_t SS_PINS[] = {26, 25, 13}; 
+const uint8_t SS_PINS[] = {26}; 
 const int NUM_READERS = sizeof(SS_PINS) / sizeof(SS_PINS[0]);
 
 // --- LED Pins Array (one white LED above each reader) ---
 // Must match NUM_READERS in count. Expand alongside SS_PINS.
-const uint8_t LED_PINS[] = {2, 16, 17};
+const uint8_t LED_PINS[] = {18, 16, 17};
 const int NUM_LEDS = sizeof(LED_PINS) / sizeof(LED_PINS[0]);
 
 Adafruit_PN532* nfcReaders[NUM_READERS];
@@ -66,7 +66,15 @@ int player1Score = 0;
 int player2Score = 0;
 unsigned long roundEndTime = 0;
 const unsigned long ROUND_DURATION = 5000; // 5s for testing. Change to 90000 for production.
-bool buttonPressed = false;
+
+// --- Button Debounce & Long-Press State ---
+bool lastButtonState = HIGH;       // Previous raw reading (INPUT_PULLUP: HIGH = released)
+bool buttonState = HIGH;           // Debounced state
+unsigned long lastDebounceTime = 0;
+const unsigned long DEBOUNCE_DELAY = 50; // 50ms debounce window
+unsigned long buttonPressStart = 0;      // millis() when button was first pressed
+bool longPressHandled = false;           // Prevents repeat-firing during a single long press
+const unsigned long LONG_PRESS_MS = 3000; // 3 second hold to reset
 
 WebServer server(80);
 Preferences preferences;
@@ -425,8 +433,24 @@ void allLEDsOff() {
   }
 }
 
-void IRAM_ATTR handleButton() {
-  buttonPressed = true;
+// --- Reset the game to initial PREP state ---
+void resetGame() {
+  currentRound = 1;
+  player1Score = 0;
+  player2Score = 0;
+  allLEDsOff();
+  isWriteMode = false;
+  for (int i = 0; i < NUM_READERS; i++) {
+    lastTagUIDs[i][0] = "Waiting...";
+    lastTagUIDs[i][1] = "Waiting...";
+  }
+  currentState = PREP;
+  // Feedback: descending tone to indicate reset
+  playTone(1000, 150); delay(160);
+  playTone(600, 150);  delay(160);
+  playTone(300, 300);
+  delay(400);
+  updateOLED("RESET", "Game cleared.", String(totalShapes) + " shapes loaded.", "Press Start");
 }
 
 // --- Helper: get game state name as string ---
@@ -460,7 +484,6 @@ void setup() {
   randomSeed(esp_random());
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButton, FALLING);
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(RESET_MOTOR_PIN, OUTPUT);
   digitalWrite(RESET_MOTOR_PIN, LOW);
@@ -675,10 +698,53 @@ void checkNFC(Adafruit_PN532* nfc, int readerNum) {
 void loop() {
   server.handleClient();
 
-  bool btn = false;
-  noInterrupts();
-  if (buttonPressed) { btn = true; buttonPressed = false; }
-  interrupts();
+  // --- Debounced Button Read with Long-Press Detection ---
+  bool btn = false;        // True for ONE loop cycle on short-press release
+  bool longPress = false;  // True for ONE loop cycle when 3s hold is detected
+
+  bool reading = digitalRead(BUTTON_PIN);
+
+  // Reset debounce timer whenever the raw reading changes
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+  lastButtonState = reading;
+
+  // Only accept the reading after it's been stable for DEBOUNCE_DELAY
+  if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
+    // Detect edges on the debounced state
+    if (reading != buttonState) {
+      bool prevState = buttonState;
+      buttonState = reading;
+
+      if (buttonState == LOW && prevState == HIGH) {
+        // --- Button just pressed (falling edge) ---
+        buttonPressStart = millis();
+        longPressHandled = false;
+      }
+      else if (buttonState == HIGH && prevState == LOW) {
+        // --- Button just released (rising edge) ---
+        if (!longPressHandled) {
+          // Short press — only if we didn't already fire a long press
+          btn = true;
+        }
+      }
+    }
+
+    // --- Long-press detection while held ---
+    if (buttonState == LOW && !longPressHandled) {
+      if ((millis() - buttonPressStart) >= LONG_PRESS_MS) {
+        longPressHandled = true;
+        longPress = true;
+      }
+    }
+  }
+
+  // --- Handle long press: reset game from any state ---
+  if (longPress) {
+    resetGame();
+    return; // Skip the rest of this loop iteration
+  }
 
   if (isWriteMode) {
     static int writeReaderIndex = 0;
