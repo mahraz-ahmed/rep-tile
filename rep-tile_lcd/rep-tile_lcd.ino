@@ -14,9 +14,8 @@ const char* ap_password = "password123";
 #define PN532_SCK  27
 #define PN532_MISO 14
 #define PN532_MOSI 32
-#define BUTTON_PIN 4        
-#define BUZZER_PIN 19       
-#define RESET_MOTOR_PIN 23  
+#define BUTTON_PIN 4
+#define BUZZER_PIN 19
 
 // --- LCD Configuration ---
 // The PCF8574T I2C backpack typically uses address 0x27.
@@ -28,18 +27,38 @@ const char* ap_password = "password123";
 LiquidCrystal_I2C display(LCD_ADDRESS, LCD_COLUMNS, LCD_ROWS);
 
 // --- SS (Chip Select) Pins Array ---
-// Currently 3 readers for testing. To expand to 9, add SS pin numbers here.
-// Example: const uint8_t SS_PINS[] = {26, 25, 13, XX, XX, XX, XX, XX, XX};
-const uint8_t SS_PINS[] = {26}; 
+// Pins in use: SPI (14,27,32), I2C (21,22), BUTTON (4), BUZZER (19)
+// Avoid: 0,2 (boot strapping), 12 (must be LOW at boot), 34-39 (input-only)
+const uint8_t SS_PINS[] = {5, 13, 15, 16, 17, 18, 23, 25, 26, 33};
 const int NUM_READERS = sizeof(SS_PINS) / sizeof(SS_PINS[0]);
-
-// --- LED Pins Array (one white LED above each reader) ---
-// Must match NUM_READERS in count. Expand alongside SS_PINS.
-const uint8_t LED_PINS[] = {18, 16, 17};
-const int NUM_LEDS = sizeof(LED_PINS) / sizeof(LED_PINS[0]);
 
 Adafruit_PN532* nfcReaders[NUM_READERS];
 String lastTagUIDs[NUM_READERS][2];
+
+// --- Role Cache (UID -> role, avoids repeated page reads) ---
+struct RoleEntry { uint8_t uid[7]; uint8_t role; };
+#define ROLE_CACHE_SIZE 20
+RoleEntry roleCache[ROLE_CACHE_SIZE];
+int roleCacheCount = 0;
+
+uint8_t lookupRole(const uint8_t* uid) {
+  for (int i = 0; i < roleCacheCount; i++)
+    if (memcmp(roleCache[i].uid, uid, 7) == 0) return roleCache[i].role;
+  return 0xFF;
+}
+
+void storeRole(const uint8_t* uid, uint8_t role) {
+  for (int i = 0; i < roleCacheCount; i++) {
+    if (memcmp(roleCache[i].uid, uid, 7) == 0) { roleCache[i].role = role; return; }
+  }
+  if (roleCacheCount < ROLE_CACHE_SIZE) {
+    memcpy(roleCache[roleCacheCount].uid, uid, 7);
+    roleCache[roleCacheCount].role = role;
+    roleCacheCount++;
+  }
+}
+
+void clearRoleCache() { roleCacheCount = 0; }
 
 // --- Global States & Variables ---
 bool isWriteMode = false;
@@ -151,7 +170,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     <p style="margin-bottom: 5px; margin-top: 15px;">Select valid answer slots for this shape:</p>
     <div class="checkbox-grid">
       <script>
-        for(let i=2; i<=10; i++) {
+        for(let i=2; i<=11; i++) {
           document.write('<div class="checkbox-item"><label>Slot '+i+' <input type="checkbox" id="sr'+i+'"></label></div>');
         }
       </script>
@@ -256,7 +275,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       if(!name) return alert('Enter a shape name!');
       let diff = document.getElementById('shapeDiff').value;
       let mask = 0;
-      for(let i=2; i<=10; i++) {
+      for(let i=2; i<=11; i++) {
         if(document.getElementById('sr'+i).checked) mask |= (1 << (i - 2));
       }
       fetch('/addShape?name='+encodeURIComponent(name)+'&mask='+mask+'&diff='+diff).then(() => {
@@ -264,7 +283,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         s.style.display = 'block'; setTimeout(() => s.style.display = 'none', 3000);
         document.getElementById('shapeName').value = '';
         document.getElementById('shapeDiff').value = '1';
-        for(let i=2; i<=10; i++) document.getElementById('sr'+i).checked = false;
+        for(let i=2; i<=11; i++) document.getElementById('sr'+i).checked = false;
         loadShapes();
       });
     }
@@ -280,7 +299,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         let html = '';
         data.forEach((s, index) => {
           let slots = [];
-          for(let i=0; i<9; i++) { if(s.mask & (1 << i)) slots.push(i+2); }
+          for(let i=0; i<10; i++) { if(s.mask & (1 << i)) slots.push(i+2); }
           let slotStr = slots.length > 0 ? slots.join(', ') : 'None';
           let diffLabel = s.diff===1?'Easy':(s.diff===2?'Medium':'Hard');
           let diffColor = s.diff===1?'#4CAF50':(s.diff===2?'#FFC107':'#f44336');
@@ -389,6 +408,14 @@ void setRFField(Adafruit_PN532* nfc, bool enable) {
   nfc->sendCommandCheckAck(cmd, sizeof(cmd));
 }
 
+void allFieldsOff() {
+  for (int i = 0; i < NUM_READERS; i++) setRFField(nfcReaders[i], false);
+}
+
+void allFieldsOn() {
+  for (int i = 0; i < NUM_READERS; i++) setRFField(nfcReaders[i], true);
+}
+
 void playTone(int frequency, int duration) {
   tone(BUZZER_PIN, frequency, duration);
 }
@@ -434,19 +461,14 @@ void initReader(Adafruit_PN532* nfc, int readerNum) {
   }
 }
 
-void allLEDsOff() {
-  for (int i = 0; i < NUM_LEDS; i++) {
-    digitalWrite(LED_PINS[i], LOW);
-  }
-}
-
 // --- Reset the game to initial PREP state ---
 void resetGame() {
   currentRound = 1;
   player1Score = 0;
   player2Score = 0;
-  allLEDsOff();
   isWriteMode = false;
+  allFieldsOff();
+  clearRoleCache();
   for (int i = 0; i < NUM_READERS; i++) {
     lastTagUIDs[i][0] = "Waiting...";
     lastTagUIDs[i][1] = "Waiting...";
@@ -492,14 +514,6 @@ void setup() {
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(RESET_MOTOR_PIN, OUTPUT);
-  digitalWrite(RESET_MOTOR_PIN, LOW);
-
-  // Initialise LEDs
-  for (int i = 0; i < NUM_LEDS; i++) {
-    pinMode(LED_PINS[i], OUTPUT);
-    digitalWrite(LED_PINS[i], LOW);
-  }
 
   display.init();
   display.backlight();
@@ -530,6 +544,7 @@ void setup() {
     String mode = server.arg("mode");
     if (mode == "write") {
       isWriteMode = true;
+      clearRoleCache(); // tags may be re-written with new roles
       if (server.hasArg("role")) currentPlayerWriteRole = server.arg("role").toInt();
       updateOLED("WRITE MODE", "Role: Player " + String(currentPlayerWriteRole), "Tap tag to reader");
     } else {
@@ -630,23 +645,24 @@ void setup() {
 
 void checkNFC(Adafruit_PN532* nfc, int readerNum) {
   int arrayIndex = readerNum - 1;
-  setRFField(nfc, true);
-  delay(10); 
 
-  // --- WRITE MODE ---
+  // --- WRITE MODE: cycle field manually so only one reader is active ---
   if (isWriteMode) {
+    setRFField(nfc, true);
+    delay(5);
     uint8_t uid[7]; uint8_t uidLength;
     if (nfc->readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 50)) {
-      if (uidLength == 7) { 
+      if (uidLength == 7) {
         updateOLED("WRITING...", "Reader " + String(readerNum), "Keep steady");
         uint8_t pageData[4] = { currentPlayerWriteRole, 0, 0, 0 };
         if (nfc->mifareultralight_WritePage(6, pageData)) {
+          storeRole(uid, currentPlayerWriteRole);
           updateOLED("SUCCESS!", "Tag is Player " + String(currentPlayerWriteRole), "Next tag...");
-          playTone(2000, 100); delay(100); playTone(2000, 100); 
-          delay(1000); 
+          playTone(2000, 100); delay(100); playTone(2000, 100);
+          delay(1000);
           updateOLED("WRITE MODE", "Role: Player " + String(currentPlayerWriteRole), "Tap tag to reader");
         } else {
-          playTone(200, 500); 
+          playTone(200, 500);
           updateOLED("WRITE MODE", "Role: Player " + String(currentPlayerWriteRole), "Tap tag to reader");
         }
       }
@@ -655,19 +671,41 @@ void checkNFC(Adafruit_PN532* nfc, int readerNum) {
     return;
   }
 
-  // --- READ MODE ---
+  // --- READ MODE: field is kept on at all times during PLAYING ---
   uint8_t uid1[7]; uint8_t uid1Length = 0;
   uint8_t uid2[7]; uint8_t uid2Length = 0;
   bool success = nfc->readTwoPassiveTargetIDs(PN532_MIFARE_ISO14443A, uid1, &uid1Length, uid2, &uid2Length);
-  
+
   uint8_t tag1Role = 0; uint8_t tag2Role = 0;
 
   if (success) {
-    uint8_t data[16];
-    if (uid1Length == 7 && nfc->mifareultralight_ReadPageTarget(1, 6, data)) tag1Role = data[0]; 
-    if (uid2Length == 7 && nfc->mifareultralight_ReadPageTarget(2, 6, data)) tag2Role = data[0];
+    if (uid1Length == 7) {
+      uint8_t cached = lookupRole(uid1);
+      if (cached != 0xFF) {
+        tag1Role = cached;
+      } else {
+        uint8_t data[16];
+        if (nfc->mifareultralight_ReadPageTarget(1, 6, data)) {
+          tag1Role = data[0];
+          storeRole(uid1, tag1Role);
+        }
+      }
+    }
+    if (uid2Length == 7) {
+      uint8_t cached = lookupRole(uid2);
+      if (cached != 0xFF) {
+        tag2Role = cached;
+      } else {
+        uint8_t data[16];
+        if (nfc->mifareultralight_ReadPageTarget(2, 6, data)) {
+          tag2Role = data[0];
+          storeRole(uid2, tag2Role);
+        }
+      }
+    }
+    // Put tags back to IDLE so they're findable on the next scan without a field cycle
+    nfc->inRelease(0);
   }
-  setRFField(nfc, false);
 
   String newUID1 = "Waiting..."; String newUID2 = "Waiting...";
 
@@ -689,12 +727,6 @@ void checkNFC(Adafruit_PN532* nfc, int readerNum) {
   if (newUID1 != lastTagUIDs[arrayIndex][0] || newUID2 != lastTagUIDs[arrayIndex][1]) {
     if (currentState == PLAYING && (newUID1 != "Waiting..." || newUID2 != "Waiting...")) {
       playTone(1500, 100);
-      // Flash LED above this reader for immediate feedback
-      if (arrayIndex < NUM_LEDS) {
-        digitalWrite(LED_PINS[arrayIndex], HIGH);
-        delay(150);
-        digitalWrite(LED_PINS[arrayIndex], LOW);
-      }
     }
     lastTagUIDs[arrayIndex][0] = newUID1;
     lastTagUIDs[arrayIndex][1] = newUID2;
@@ -832,8 +864,9 @@ void loop() {
     case ROUND_INTRO:
       if (btn) {
         currentState = PLAYING;
+        allFieldsOn();
         roundEndTime = millis() + ROUND_DURATION;
-        playTone(800, 200); delay(200); playTone(1200, 400); 
+        playTone(800, 200); delay(200); playTone(1200, 400);
       }
       break;
 
@@ -857,8 +890,9 @@ void loop() {
 
         // Time's Up - Scoring Phase
         if (millis() >= roundEndTime) {
+          allFieldsOff();
           currentState = SCORING;
-          playTone(500, 1000); 
+          playTone(500, 1000);
           updateOLED("TIME'S UP!", "Calculating...");
           delay(2000);
           
@@ -879,21 +913,9 @@ void loop() {
             }
           }
 
-          // Light up LEDs above correct readers to reveal answers
-          for (int i = 0; i < NUM_LEDS; i++) {
-            digitalWrite(LED_PINS[i], (requiredMask & (1 << i)) ? HIGH : LOW);
-          }
-
           // Show scores
           updateOLED("SCORES", "P1:" + String(player1Score) + " P2:" + String(player2Score));
           delay(3000);
-
-          // Auto-reset mechanism: drop tokens
-          updateOLED("RESETTING", "Clearing tokens...");
-          delay(500);
-          digitalWrite(RESET_MOTOR_PIN, HIGH);
-          delay(1500); 
-          digitalWrite(RESET_MOTOR_PIN, LOW);
 
           // Clear tag data
           for (int i = 0; i < NUM_READERS; i++) {
@@ -909,9 +931,6 @@ void loop() {
 
     case SCORING:
       if (btn) {
-        // Turn off answer LEDs
-        allLEDsOff();
-
         currentRound++;
         if (currentRound > 3) {
           currentState = GAME_OVER;
@@ -933,7 +952,6 @@ void loop() {
         currentRound = 1;
         player1Score = 0;
         player2Score = 0;
-        allLEDsOff();
         currentState = PREP;
         updateOLED("READY", "ESP32 Running", String(totalShapes) + " shapes loaded.", "Press Start");
         delay(500);
